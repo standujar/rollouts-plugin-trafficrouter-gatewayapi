@@ -71,6 +71,80 @@ var HTTPRouteObj = gatewayv1.HTTPRoute{
 	},
 }
 
+// NestedHTTPRouteObj represents an HTTPRoute that references other HTTPRoutes
+var (
+	httpRouteGroup = gatewayv1.Group("gateway.networking.k8s.io")
+	httpRouteKind  = gatewayv1.Kind("HTTPRoute")
+	serviceKind    = gatewayv1.Kind("Service")
+	serviceGroup   = gatewayv1.Group("")
+)
+
+var NestedHTTPRouteMainObj = gatewayv1.HTTPRoute{
+	ObjectMeta: metav1.ObjectMeta{
+		Name:      "nested-http-route-main",
+		Namespace: RolloutNamespace,
+	},
+	Spec: gatewayv1.HTTPRouteSpec{
+		Rules: []gatewayv1.HTTPRouteRule{
+			{
+				BackendRefs: []gatewayv1.HTTPBackendRef{
+					{
+						BackendRef: gatewayv1.BackendRef{
+							BackendObjectReference: gatewayv1.BackendObjectReference{
+								Group: &httpRouteGroup,
+								Kind:  &httpRouteKind,
+								Name:  "nested-http-route-child",
+							},
+						},
+					},
+				},
+				Matches: []gatewayv1.HTTPRouteMatch{
+					{
+						Path: &httpPathMatch,
+					},
+				},
+			},
+		},
+	},
+}
+
+var NestedHTTPRouteChildObj = gatewayv1.HTTPRoute{
+	ObjectMeta: metav1.ObjectMeta{
+		Name:      "nested-http-route-child",
+		Namespace: RolloutNamespace,
+	},
+	Spec: gatewayv1.HTTPRouteSpec{
+		Rules: []gatewayv1.HTTPRouteRule{
+			{
+				BackendRefs: []gatewayv1.HTTPBackendRef{
+					{
+						BackendRef: gatewayv1.BackendRef{
+							BackendObjectReference: gatewayv1.BackendObjectReference{
+								Group: &serviceGroup,
+								Kind:  &serviceKind,
+								Name:  StableServiceName,
+								Port:  &port,
+							},
+							Weight: &weight,
+						},
+					},
+					{
+						BackendRef: gatewayv1.BackendRef{
+							BackendObjectReference: gatewayv1.BackendObjectReference{
+								Group: &serviceGroup,
+								Kind:  &serviceKind,
+								Name:  CanaryServiceName,
+								Port:  &port,
+							},
+							Weight: &weight,
+						},
+					},
+				},
+			},
+		},
+	},
+}
+
 var GRPCRouteObj = gatewayv1.GRPCRoute{
 	ObjectMeta: metav1.ObjectMeta{
 		Name:      GRPCRouteName,

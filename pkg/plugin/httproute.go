@@ -11,11 +11,142 @@ import (
 	pluginTypes "github.com/argoproj/argo-rollouts/utils/plugin/types"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayApiClientv1 "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned/typed/apis/v1"
 )
 
 const (
 	HTTPConfigMapKey = "httpManagedRoutes"
 )
+
+// Helper function to check if a backendRef is an HTTPRoute reference
+func isHTTPRouteRef(backendRef gatewayv1.HTTPBackendRef) bool {
+	// Check if Group and Kind point to an HTTPRoute
+	return backendRef.BackendRef.BackendObjectReference.Group != nil &&
+		*backendRef.BackendRef.BackendObjectReference.Group == "gateway.networking.k8s.io" &&
+		backendRef.BackendRef.BackendObjectReference.Kind != nil &&
+		*backendRef.BackendRef.BackendObjectReference.Kind == "HTTPRoute"
+}
+
+// HTTPRouteReference holds information about an HTTPRoute and its path to the target service
+type HTTPRouteReference struct {
+	Route     *gatewayv1.HTTPRoute
+	RuleIndex int
+	RefIndex  int
+}
+
+// findServiceInNestedHTTPRoutes recursively searches for a service in nested HTTPRoutes
+func (r *RpcPlugin) findServiceInNestedHTTPRoutes(
+	ctx context.Context,
+	httpRouteClient gatewayApiClientv1.HTTPRouteInterface,
+	currentRoute *gatewayv1.HTTPRoute,
+	serviceName string,
+	visited map[string]bool,
+	path []HTTPRouteReference,
+) ([][]HTTPRouteReference, error) {
+	// Prevent infinite loops
+	routeKey := fmt.Sprintf("%s/%s", currentRoute.Namespace, currentRoute.Name)
+	if visited[routeKey] {
+		return nil, nil
+	}
+	visited[routeKey] = true
+
+	var allPaths [][]HTTPRouteReference
+
+	// Check all rules in the current HTTPRoute
+	for ruleIdx, rule := range currentRoute.Spec.Rules {
+		for refIdx, backendRef := range rule.BackendRefs {
+			// If this is a direct service reference
+			if string(backendRef.Name) == serviceName && !isHTTPRouteRef(backendRef) {
+				// Found the service, add current path
+				currentPath := append([]HTTPRouteReference{}, path...)
+				currentPath = append(currentPath, HTTPRouteReference{
+					Route:     currentRoute,
+					RuleIndex: ruleIdx,
+					RefIndex:  refIdx,
+				})
+				allPaths = append(allPaths, currentPath)
+			} else if isHTTPRouteRef(backendRef) {
+				// This is an HTTPRoute reference, follow it
+				nestedRouteName := string(backendRef.Name)
+				nestedRoute, err := httpRouteClient.Get(ctx, nestedRouteName, metav1.GetOptions{})
+				if err != nil {
+					r.LogCtx.Info(fmt.Sprintf("Could not get nested HTTPRoute %s: %v", nestedRouteName, err))
+					continue
+				}
+
+				// Add current route to path before recursing
+				newPath := append([]HTTPRouteReference{}, path...)
+				newPath = append(newPath, HTTPRouteReference{
+					Route:     currentRoute,
+					RuleIndex: ruleIdx,
+					RefIndex:  refIdx,
+				})
+
+				// Recurse into nested HTTPRoute
+				nestedPaths, err := r.findServiceInNestedHTTPRoutes(ctx, httpRouteClient, nestedRoute, serviceName, visited, newPath)
+				if err != nil {
+					return nil, err
+				}
+				allPaths = append(allPaths, nestedPaths...)
+			}
+		}
+	}
+
+	return allPaths, nil
+}
+
+// updateHTTPRouteWeights updates weights for all HTTPRoutes in the paths
+func (r *RpcPlugin) updateHTTPRouteWeights(
+	ctx context.Context,
+	httpRouteClient gatewayApiClientv1.HTTPRouteInterface,
+	canaryPaths [][]HTTPRouteReference,
+	stablePaths [][]HTTPRouteReference,
+	desiredWeight int32,
+) error {
+	updatedRoutes := make(map[string]*gatewayv1.HTTPRoute)
+
+	// Update weights for canary paths
+	for _, path := range canaryPaths {
+		for _, ref := range path {
+			routeKey := fmt.Sprintf("%s/%s", ref.Route.Namespace, ref.Route.Name)
+			route, exists := updatedRoutes[routeKey]
+			if !exists {
+				// Clone the route
+				route = ref.Route.DeepCopy()
+				updatedRoutes[routeKey] = route
+			}
+			// Update weight
+			route.Spec.Rules[ref.RuleIndex].BackendRefs[ref.RefIndex].Weight = &desiredWeight
+		}
+	}
+
+	// Update weights for stable paths
+	restWeight := 100 - desiredWeight
+	for _, path := range stablePaths {
+		for _, ref := range path {
+			routeKey := fmt.Sprintf("%s/%s", ref.Route.Namespace, ref.Route.Name)
+			route, exists := updatedRoutes[routeKey]
+			if !exists {
+				// Clone the route
+				route = ref.Route.DeepCopy()
+				updatedRoutes[routeKey] = route
+			}
+			// Update weight
+			route.Spec.Rules[ref.RuleIndex].BackendRefs[ref.RefIndex].Weight = &restWeight
+		}
+	}
+
+	// Apply all updates
+	for _, route := range updatedRoutes {
+		_, err := httpRouteClient.Update(ctx, route, metav1.UpdateOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to update HTTPRoute %s/%s: %w", route.Namespace, route.Name, err)
+		}
+		r.LogCtx.Info(fmt.Sprintf("Updated HTTPRoute %s/%s", route.Namespace, route.Name))
+	}
+
+	return nil
+}
 
 func (r *RpcPlugin) setHTTPRouteWeight(rollout *v1alpha1.Rollout, desiredWeight int32, additionalDestinations []v1alpha1.WeightDestination, gatewayAPIConfig *GatewayAPITrafficRouting) pluginTypes.RpcError {
 	ctx := context.TODO()
@@ -32,39 +163,70 @@ func (r *RpcPlugin) setHTTPRouteWeight(rollout *v1alpha1.Rollout, desiredWeight 
 	}
 	canaryServiceName := rollout.Spec.Strategy.Canary.CanaryService
 	stableServiceName := rollout.Spec.Strategy.Canary.StableService
-	routeRuleList := HTTPRouteRuleList(httpRoute.Spec.Rules)
-	canaryBackendRefs, err := getBackendRefs(canaryServiceName, routeRuleList)
+
+	// Use recursive search to find services (will find direct refs first, then nested)
+	visited := make(map[string]bool)
+
+	// Find all paths to canary service
+	canaryPaths, err := r.findServiceInNestedHTTPRoutes(ctx, httpRouteClient, httpRoute, canaryServiceName, visited, nil)
+	if err != nil {
+		return pluginTypes.RpcError{
+			ErrorString: fmt.Sprintf("failed to find canary service: %v", err),
+		}
+	}
+
+	// Reset visited map for stable service search
+	visited = make(map[string]bool)
+
+	// Find all paths to stable service
+	stablePaths, err := r.findServiceInNestedHTTPRoutes(ctx, httpRouteClient, httpRoute, stableServiceName, visited, nil)
+	if err != nil {
+		return pluginTypes.RpcError{
+			ErrorString: fmt.Sprintf("failed to find stable service: %v", err),
+		}
+	}
+
+	if len(canaryPaths) == 0 {
+		return pluginTypes.RpcError{
+			ErrorString: fmt.Sprintf("canary service %s not found in HTTPRoute", canaryServiceName),
+		}
+	}
+
+	if len(stablePaths) == 0 {
+		return pluginTypes.RpcError{
+			ErrorString: fmt.Sprintf("stable service %s not found in HTTPRoute", stableServiceName),
+		}
+	}
+
+	// Update weights in all HTTPRoutes
+	err = r.updateHTTPRouteWeights(ctx, httpRouteClient, canaryPaths, stablePaths, desiredWeight)
 	if err != nil {
 		return pluginTypes.RpcError{
 			ErrorString: err.Error(),
 		}
 	}
-	for _, ref := range canaryBackendRefs {
-		ref.Weight = &desiredWeight
-	}
-	stableBackendRefs, err := getBackendRefs(stableServiceName, routeRuleList)
-	if err != nil {
-		return pluginTypes.RpcError{
-			ErrorString: err.Error(),
+
+	// For test compatibility - update mock with the main route if it was updated
+	if r.IsTest {
+		for _, path := range append(canaryPaths, stablePaths...) {
+			if len(path) > 0 && path[0].Route.Name == httpRoute.Name {
+				// Re-fetch the updated route for the mock
+				updatedRoute, err := httpRouteClient.Get(ctx, httpRoute.Name, metav1.GetOptions{})
+				if err == nil {
+					r.UpdatedHTTPRouteMock = updatedRoute
+				}
+				break
+			}
 		}
 	}
-	restWeight := 100 - desiredWeight
-	for _, ref := range stableBackendRefs {
-		ref.Weight = &restWeight
-	}
+
+	// Handle experiments if needed
+	// Note: This might need adjustment for nested routes
 	err = HandleExperiment(ctx, r.Clientset, r.GatewayAPIClientset, r.LogCtx, rollout, httpRoute, additionalDestinations)
 	if err != nil {
 		r.LogCtx.Error(err, "Failed to handle experiment services")
 	}
-	updatedHTTPRoute, err := httpRouteClient.Update(ctx, httpRoute, metav1.UpdateOptions{})
-	if r.IsTest {
-		r.UpdatedHTTPRouteMock = updatedHTTPRoute
-	}
-	if err != nil {
-		return pluginTypes.RpcError{
-			ErrorString: err.Error(),
-		}
-	}
+
 	return pluginTypes.RpcError{}
 }
 
